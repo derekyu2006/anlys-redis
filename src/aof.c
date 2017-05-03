@@ -271,24 +271,10 @@ int startAppendOnly(void) {
   return C_OK;
 }
 
-/* Write the append only file buffer on disk.
- *
- * Since we are required to write the AOF before replying to the client,
- * and the only way the client socket can get a write is entering when the
- * the event loop, we accumulate all the AOF writes in a memory
- * buffer and write it on disk using this function just before entering
- * the event loop again.
- *
- * About the 'force' argument:
- *
- * When the fsync policy is set to 'everysec' we may delay the flush if there
- * is still an fsync() going on in the background thread, since for instance
- * on Linux write(2) will be blocked by the background fsync anyway.
- * When this happens we remember that there is some aof buffer to be
- * flushed ASAP, and will try to do that in the serverCron() function.
- *
- * However if force is set to 1 we'll write regardless of the background
- * fsync. */
+// 刷新缓存区的内容到磁盘中
+// 该函数需要重点关注server.aof_fsync参数, 设置Redis fsync AOF文件到硬盘的策略
+// 如果设置为AOF_FSYNC_ALWAYS, 那么直接在主进程中fsync
+// 如果设置为AOF_FSYNC_EVERYSEC, 那么放入后台线程中fsync, 后台线程的代码在bio.c中
 #define AOF_WRITE_LOG_ERROR_RATE 30 /* Seconds between errors logging. */
 void flushAppendOnlyFile(int force) {
   ssize_t nwritten;
@@ -298,43 +284,27 @@ void flushAppendOnlyFile(int force) {
   if (sdslen(server.aof_buf) == 0) return;
 
   if (server.aof_fsync == AOF_FSYNC_EVERYSEC)
+    // 返回后台正在等待执行的fsync数量
     sync_in_progress = bioPendingJobsOfType(BIO_AOF_FSYNC) != 0;
 
   if (server.aof_fsync == AOF_FSYNC_EVERYSEC && !force) {
-    /* With this append fsync policy we do background fsyncing.
-     * If the fsync is still in progress we can try to delay
-     * the write for a couple of seconds. */
     if (sync_in_progress) {
       if (server.aof_flush_postponed_start == 0) {
-        /* No previous write postponing, remember that we are
-         * postponing the flush and return. */
+        // 上一次没有推迟冲洗过, 记录推延的当前时间, 然后返回
         server.aof_flush_postponed_start = server.unixtime;
         return;
       } else if (server.unixtime - server.aof_flush_postponed_start < 2) {
-        /* We were already waiting for fsync to finish, but for less
-         * than two seconds this is still ok. Postpone again. */
+        // 如果现在距上次冲洗的时间小于2s, 就拖延冲洗.
         return;
       }
-      /* Otherwise fall trough, and go write since we can't wait
-       * over two seconds. */
       server.aof_delayed_fsync++;
-      serverLog(LL_NOTICE,"Asynchronous AOF fsync is taking too long (disk is busy?). Writing the AOF buffer without waiting for fsync to complete, this may slow down Redis.");
     }
   }
-  /* We want to perform a single write. This should be guaranteed atomic
-   * at least if the filesystem we are writing is a real physical one.
-   * While this will save us against the server being killed I don't think
-   * there is much to do about the whole server stopping for power problems
-   * or alike */
 
   latencyStartMonitor(latency);
+  // 开始写aof文件了, 如果一切幸运的话写入会原子性地完成
   nwritten = write(server.aof_fd,server.aof_buf,sdslen(server.aof_buf));
   latencyEndMonitor(latency);
-  /* We want to capture different events for delayed writes:
-   * when the delay happens with a pending fsync, or with a saving child
-   * active, and when the above two conditions are missing.
-   * We also use an additional event name to save all samples which is
-   * useful for graphing / monitoring purposes. */
   if (sync_in_progress) {
     latencyAddSampleIfNeeded("aof-write-pending-fsync",latency);
   } else if (server.aof_child_pid != -1 || server.rdb_child_pid != -1) {
@@ -344,85 +314,11 @@ void flushAppendOnlyFile(int force) {
   }
   latencyAddSampleIfNeeded("aof-write",latency);
 
-  /* We performed the write so reset the postponed flush sentinel to zero. */
   server.aof_flush_postponed_start = 0;
 
-  if (nwritten != (signed)sdslen(server.aof_buf)) {
-    static time_t last_write_error_log = 0;
-    int can_log = 0;
-
-    /* Limit logging rate to 1 line per AOF_WRITE_LOG_ERROR_RATE seconds. */
-    if ((server.unixtime - last_write_error_log) > AOF_WRITE_LOG_ERROR_RATE) {
-      can_log = 1;
-      last_write_error_log = server.unixtime;
-    }
-
-    /* Log the AOF write error and record the error code. */
-    if (nwritten == -1) {
-      if (can_log) {
-        serverLog(LL_WARNING,"Error writing to the AOF file: %s",
-          strerror(errno));
-        server.aof_last_write_errno = errno;
-      }
-    } else {
-      if (can_log) {
-        serverLog(LL_WARNING,"Short write while writing to "
-                     "the AOF file: (nwritten=%lld, "
-                     "expected=%lld)",
-                     (long long)nwritten,
-                     (long long)sdslen(server.aof_buf));
-      }
-
-      if (ftruncate(server.aof_fd, server.aof_current_size) == -1) {
-        if (can_log) {
-          serverLog(LL_WARNING, "Could not remove short write "
-               "from the append-only file.  Redis may refuse "
-               "to load the AOF the next time it starts.  "
-               "ftruncate: %s", strerror(errno));
-        }
-      } else {
-        /* If the ftruncate() succeeded we can set nwritten to
-         * -1 since there is no longer partial data into the AOF. */
-        nwritten = -1;
-      }
-      server.aof_last_write_errno = ENOSPC;
-    }
-
-    /* Handle the AOF write error. */
-    if (server.aof_fsync == AOF_FSYNC_ALWAYS) {
-      /* We can't recover when the fsync policy is ALWAYS since the
-       * reply for the client is already in the output buffers, and we
-       * have the contract with the user that on acknowledged write data
-       * is synced on disk. */
-      serverLog(LL_WARNING,"Can't recover from AOF write error when the AOF fsync policy is 'always'. Exiting...");
-      exit(1);
-    } else {
-      /* Recover from failed write leaving data into the buffer. However
-       * set an error to stop accepting writes as long as the error
-       * condition is not cleared. */
-      server.aof_last_write_status = C_ERR;
-
-      /* Trim the sds buffer if there was a partial write, and there
-       * was no way to undo it with ftruncate(2). */
-      if (nwritten > 0) {
-        server.aof_current_size += nwritten;
-        sdsrange(server.aof_buf,nwritten,-1);
-      }
-      return; /* We'll try again on the next call... */
-    }
-  } else {
-    /* Successful write(2). If AOF was in error state, restore the
-     * OK state and log the event. */
-    if (server.aof_last_write_status == C_ERR) {
-      serverLog(LL_WARNING,
-        "AOF write error looks solved, Redis can write again.");
-      server.aof_last_write_status = C_OK;
-    }
-  }
   server.aof_current_size += nwritten;
 
-  /* Re-use AOF buffer when it is small enough. The maximum comes from the
-   * arena size of 4k minus some overhead (but is otherwise arbitrary). */
+  // 如aof缓存不是太大, 那么重用它, 否则清空aof缓存
   if ((sdslen(server.aof_buf)+sdsavail(server.aof_buf)) < 4000) {
     sdsclear(server.aof_buf);
   } else {
@@ -430,23 +326,22 @@ void flushAppendOnlyFile(int force) {
     server.aof_buf = sdsempty();
   }
 
-  /* Don't fsync if no-appendfsync-on-rewrite is set to yes and there are
-   * children doing I/O in the background. */
-  if (server.aof_no_fsync_on_rewrite &&
-    (server.aof_child_pid != -1 || server.rdb_child_pid != -1))
-      return;
+  // aof rdb子进程运行中不支持fsync
+  // 这里数据已经写到aof文件中, 只是没有刷新到硬盘
+  if (server.aof_no_fsync_on_rewrite && (server.aof_child_pid != -1
+      || server.rdb_child_pid != -1))
+    return;
 
-  /* Perform the fsync if needed. */
+  // 总是fsync，那么直接进行fsync
   if (server.aof_fsync == AOF_FSYNC_ALWAYS) {
-    /* aof_fsync is defined as fdatasync() for Linux in order to avoid
-     * flushing metadata. */
     latencyStartMonitor(latency);
-    aof_fsync(server.aof_fd); /* Let's try to get this data on the disk */
+    aof_fsync(server.aof_fd);
     latencyEndMonitor(latency);
     latencyAddSampleIfNeeded("aof-fsync-always",latency);
     server.aof_last_fsync = server.unixtime;
   } else if ((server.aof_fsync == AOF_FSYNC_EVERYSEC &&
         server.unixtime > server.aof_last_fsync)) {
+    // 放到后台线程进行fsync
     if (!sync_in_progress) aof_background_fsync(server.aof_fd);
     server.aof_last_fsync = server.unixtime;
   }
@@ -613,17 +508,15 @@ void freeFakeClient(struct client *c) {
   zfree(c);
 }
 
-/* Replay the append log file. On success C_OK is returned. On non fatal
- * error (the append only file is zero-length) C_ERR is returned. On
- * fatal error an error message is logged and the program exists. */
 int loadAppendOnlyFile(char *filename) {
   struct client *fakeClient;
   FILE *fp = fopen(filename,"r");
   struct redis_stat sb;
   int old_aof_state = server.aof_state;
   long loops = 0;
-  off_t valid_up_to = 0; /* Offset of the latest well-formed command loaded. */
+  off_t valid_up_to = 0;
 
+  // 获取文件的状态存储于sb中.
   if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
     server.aof_current_size = 0;
     fclose(fp);
@@ -631,12 +524,9 @@ int loadAppendOnlyFile(char *filename) {
   }
 
   if (fp == NULL) {
-    serverLog(LL_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
     exit(1);
   }
 
-  /* Temporarily disable AOF, to prevent EXEC from feeding a MULTI
-   * to the same file we're about to read. */
   server.aof_state = AOF_OFF;
 
   fakeClient = createFakeClient();
@@ -650,18 +540,21 @@ int loadAppendOnlyFile(char *filename) {
     sds argsds;
     struct redisCommand *cmd;
 
-    /* Serve the clients from time to time */
+    // 有间隔地处理外部请求, ftello()函数得到文件的当前位置, 返回值为long.
     if (!(loops++ % 1000)) {
-      loadingProgress(ftello(fp));
+      loadingProgress(ftello(fp)); // 保存aof文件读取的位置
       processEventsWhileBlocked();
     }
 
+    // 按行读取AOF数据
     if (fgets(buf,sizeof(buf),fp) == NULL) {
       if (feof(fp))
         break;
       else
         goto readerr;
     }
+
+    // 读取AOF文件中的命令，依照Redis的协议处理
     if (buf[0] != '*') goto fmterr;
     if (buf[1] == '\0') goto readerr;
     argc = atoi(buf+1);
@@ -697,34 +590,26 @@ int loadAppendOnlyFile(char *filename) {
     /* Command lookup */
     cmd = lookupCommand(argv[0]->ptr);
     if (!cmd) {
-      serverLog(LL_WARNING,"Unknown command '%s' reading the append only file", (char*)argv[0]->ptr);
       exit(1);
     }
 
-    /* Run the command in the context of a fake client */
-    cmd->proc(fakeClient);
+    cmd->proc(fakeClient); //执行命令
 
-    /* The fake client should not have a reply */
     serverAssert(fakeClient->bufpos == 0 && listLength(fakeClient->reply) == 0);
-    /* The fake client should never get blocked */
     serverAssert((fakeClient->flags & CLIENT_BLOCKED) == 0);
 
-    /* Clean up. Command code may have changed argv/argc so we use the
-     * argv/argc of the client instead of the local variables. */
     freeFakeClientArgv(fakeClient);
     if (server.aof_load_truncated) valid_up_to = ftello(fp);
   }
 
-  /* This point can only be reached when EOF is reached without errors.
-   * If the client is in the middle of a MULTI/EXEC, log error and quit. */
   if (fakeClient->flags & CLIENT_MULTI) goto uxeof;
 
-loaded_ok: /* DB loaded, cleanup and return C_OK to the caller. */
+loaded_ok:
   fclose(fp);
   freeFakeClient(fakeClient);
   server.aof_state = old_aof_state;
   stopLoading();
-  aofUpdateCurrentSize();
+  aofUpdateCurrentSize(); // 更新server.aof_current_size，AOF文件大小
   server.aof_rewrite_base_size = server.aof_current_size;
   return C_OK;
 
@@ -761,12 +646,10 @@ uxeof: /* Unexpected AOF end of file. */
     }
   }
   if (fakeClient) freeFakeClient(fakeClient); /* avoid valgrind warning */
-  serverLog(LL_WARNING,"Unexpected end of file reading the append only file. You can: 1) Make a backup of your AOF file, then use ./redis-check-aof --fix <filename>. 2) Alternatively you can set the 'aof-load-truncated' configuration option to yes and restart the server.");
   exit(1);
 
 fmterr: /* Format error. */
   if (fakeClient) freeFakeClient(fakeClient); /* avoid valgrind warning */
-  serverLog(LL_WARNING,"Bad file format reading the append only file: make a backup of your AOF file, then use ./redis-check-aof --fix <filename>");
   exit(1);
 }
 
